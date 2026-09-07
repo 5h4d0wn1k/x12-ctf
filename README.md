@@ -1,109 +1,121 @@
 # X12 — CTF Toolkit + Challenge Authorship
 
-CTF toolkit with writeup generator and 3 original challenge solutions (pwn, rev, forensics).
+Generator of real local challenges (web / crypto / misc) with flags, a SQLite
+scoreboard, and a solver-checker that solves each challenge and verifies the
+recovered flags against stored hashes. Fully offline on localhost.
 
 ## Overview
 
-This project implements a CTF toolkit and challenge authorship pack that:
-- Generates a markdown writeup index from solved challenges
-- Implements a PWN challenge: stack buffer overflow with ROP return-address overwrite
-- Implements a REV challenge: XOR-packed binary decode with key extraction
-- Implements a FORENSICS challenge: file carving from a raw disk image (PNG + JPEG)
-- Provides solve-stats reporting with step counts and hint availability for each challenge
-- Verifies all flags match expected values during the offline self-test demo
+This project implements a genuine CTF harness where every stage does real work:
+
+- **Web challenge (WEB-001)**: the generator writes an actual stdlib HTTP server
+  (`web_app.py`) that serves an index page, an admin area and a `flag.txt`
+  "flag database". The solver walks the live application over HTTP on an
+  ephemeral `127.0.0.1` port: fetch `/`, recover the admin token from the page
+  source, then authenticate to `/admin` and extract the flag from the response.
+- **Crypto challenge (CRYPTO-001)**: the generator writes a real repeat-key-XOR
+  ciphertext (`crypto_flag.enc`). The solver performs a known-plaintext key
+  recovery from the `FLAG{` prefix, then decrypts the whole flag.
+- **Misc challenge (MISC-001)**: the generator writes a noisy disk image
+  (`misc_drive.img`). The solver carves bytes after the magic marker and
+  base64-decodes the hidden payload.
+- **SQLite scoreboard**: each challenge is registered with a SHA-256 hash of its
+  flag (never the plaintext). `submit()` verifies a solver's flag against the
+  stored hash, records accepted solves with timestamps, rejects wrong or
+  duplicate submissions, and tallies scores.
+- **Solver-checker pipeline**: generate → solve → submit — the demo asserts all
+  three flags are accepted by the scoreboard and writes `reports/ctf_report.json`.
 
 ## Features
 
-- **Writeup generator**: Produces formatted markdown writeup index from solved challenges
-- **PWN challenge (PWN-001)**: Stack offset calculation and return-address overwrite exploit
-- **REV challenge (REV-001)**: ELF header analysis and XOR-packed payload decoding
-- **FORENSICS challenge (FORENSICS-001)**: File magic scanning and PNG/JPEG carving from raw image
-- **Solve-stats reporting**: Steps taken, hints available, success verification per challenge
-- **Flag verification**: All flags validated against expected values at demo time
-- **Offline demo**: Fully self-contained with embedded synthetic challenge binaries
+- **Real challenge generator**: creates runnable web server source, ciphertext,
+  disk image and a JSON `manifest.json` (hashes only, no plaintext flags)
+- **Real web solving**: HTTP requests against a live localhost stdlib server
+- **Real crypto solving**: known-plaintext repeat-key-XOR key recovery
+- **Real misc solving**: byte-level marker carving + base64 decode
+- **SQLite scoreboard**: persistent, hash-verified, duplicate-safe, size-accounting
+- **Deterministic seeds**: `--seed N` reproduces identical challenges/flags
+- **CLI**: `--generate`, `--solve`, `--demo-report`, `--dry-run`
 - **Legal disclaimer**: Heavy authorization/lab-use-only requirements
 
 ## Installation
 
 ```bash
 # No external dependencies required — pure Python standard library
-python3 ctf_toolkit.py
+python3 firmware/ctf_toolkit.py
 ```
 
 ## Usage
 
 ```bash
-# Run all challenge solves and verify flags
-python3 ctf_toolkit.py
+# Full offline demo: generate -> solve -> scoreboard (temp dir, self-cleaning)
+python3 firmware/ctf_toolkit.py
+
+# Generate challenge artifacts into challenges/
+python3 firmware/ctf_toolkit.py --generate
+
+# Solve + verify against the scoreboard
+python3 firmware/ctf_toolkit.py --solve
+
+# Full run + reports/ctf_report.json
+python3 firmware/ctf_toolkit.py --demo-report
 
 # Import as module
-from ctf_toolkit import PWNChallenge, REVChallenge, ForensicsChallenge, WriteupGenerator
-pwn = PWNChallenge()
-result = pwn.solve()
-print(result["flag"])
-
-writer = WriteupGenerator()
-writer.register(pwn, result)
-print(writer.generate_markdown())
+from ctf_toolkit import ChallengeGenerator, WebSolver, CryptoSolver, \
+    MiscSolver, Scoreboard
+gen = ChallengeGenerator("out")
+manifest = gen.generate_all()
+flag = WebSolver().solve("out")          # real HTTP against the generated server
+sb = Scoreboard("out/scoreboard.db")
+sb.register_manifest_hashes(manifest)
+print(sb.submit("WEB-001", flag))        # {'accepted': True, ...}
 ```
 
 ## Example Output
 
 ```
 [*] X12 — CTF Toolkit + Challenge Authorship
-[*] Running offline self-test...
+[*] Offline demo: generate -> solve -> SQLite scoreboard
 
-  --- PWN-001: Stack Offset ROP ---
-  Flag: FLAG{pwn_stack_offset_0x11b6}
-  Success: True
-  Steps taken: 5
-    Step 1: Identified buffer size = 60 bytes (15 x 4-byte DWORDs)
-    Step 2: Calculated offset to saved RBP = 60 bytes
-    Step 3: Overwrote saved RBP with 0x41414141 (placeholder)
-    Step 4: Overwrote return address with 0x4011B6 (win_function)
-    Step 5: Verified exploit produces win message
-  Hints available: 4
-
-  --- REV-001: XOR-Packed Binary Decode ---
-  Flag: FLAG{rev_packed_binary_decoded}
-  Success: True
-  Steps taken: 6
-    Step 1: Analyzed ELF header — identified as x86-64 ELF
-    Step 2: Found marker 'PACKED_XOR_5A:' at known offset
-    Step 3: Extracted XOR-encoded payload bytes
-    Step 4: Applied XOR 0x5A decryption
-    Step 5: Verified decoded string matches expected flag format
-    Step 6: Decoded payload: FLAG{rev_packed_binary_decoded}
-  Hints available: 3
-
-  --- FORENSICS-001: File Carving from Raw Image ---
-  Flag: FLAG{forensics_file_carved_png}
-  Success: True
-  Steps taken: 7
-    Step 1: Scanned raw image for file magic signatures
-    Step 2: Found PNG signature at offset 0x80
-    Step 3: PNG IHDR chunk — type=IHDR, data_len=31
-    Step 4: Extracted flag from PNG chunk: FLAG{forensics_file_carved_png}
-    Step 5: Found JPEG APP0 marker at offset 0x200
-    Step 6: JPEG payload: FLAG{forensics_jpeg_app0_marker}
-    Step 7: Carved 2 files from raw image
-  Hints available: 3
-
-  --- Solve Stats Summary ---
-  Total challenges: 3
-  Solved: 3/3
-  Total steps used: 18
-  Total hints available: 10
-  Average steps per challenge: 6.0
-    [PASS] PWN-001: Stack Offset ROP: FLAG{pwn_stack_offset_0x11b6}
-    [PASS] REV-001: XOR-Packed Binary Decode: FLAG{rev_packed_binary_decoded}
-    [PASS] FORENSICS-001: File Carving from Raw Image: FLAG{forensics_file_carved_png}
+[*] Generated 3 challenges in /tmp/x12_ctf_abc123
+  [PASS] WEB-001: FLAG{web_leak_admin_token_0135282b} (flag accepted)
+  [PASS] CRYPTO-001: FLAG{crypto_repeat_key_xor_knwn_pt} (flag accepted)
+  [PASS] MISC-001: FLAG{misc_carve_the_disk_image} (flag accepted)
+[+] Report written: .../reports/ctf_report.json
 
 ======================================================================
   Self-test PASSED. Demo complete.
   Legal: This toolkit is for authorized CTF/lab use only.
 ======================================================================
 ```
+
+## Live Lab Test Plan
+
+1. `python3 firmware/ctf_toolkit.py` — generates 3 real challenges, solves each
+   (web = live HTTP against the spawned stdlib server, crypto = XOR key
+   recovery, misc = disk-image carving), submits all flags to the SQLite
+   scoreboard; every flag is `flag accepted`; exit 0.
+2. `python3 firmware/ctf_toolkit.py --generate --workdir /tmp/ctf-out` — writes
+   `web_app.py`, `flag.txt`, `crypto_flag.enc`, `misc_drive.img`, `manifest.json`.
+3. `python3 firmware/ctf_toolkit.py --solve --workdir /tmp/ctf-out` — runs the
+   solver-checker and writes `scoreboard.db` with exactly 3 accepted solves.
+4. `python3 -m unittest discover -s tests` — 22 deterministic assertions,
+   including wrong-flag rejection, duplicate-solve rejection, plaintext-free
+   manifest, live-server token gate, and end-to-end generate→solve→score.
+
+## Metrics
+
+- 3 challenge categories (web/crypto/misc), each with distinct real mechanics
+- Web: real HTTP exchange over `127.0.0.1:<ephemeral>`; wrong token returns 401/no flag
+- Crypto: repeat-key XOR, key length 5, recovered purely from the `FLAG{` prefix
+- Scoreboard: SQLite, SHA-256 flag hashes, duplicate-safe, solve tallies
+- Manifest stores 0 plaintext flags (only SHA-256 digests)
+- `reports/ctf_report.json` (gitignored); `challenges/`, `reports/`, `scoreboard.db` gitignored
+- 22 unittest assertions, all offline; no external network, no external deps
+
+## License
+
+MIT
 
 ## IMPORTANT: Read before use.
 

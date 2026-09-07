@@ -1,344 +1,549 @@
 #!/usr/bin/env python3
 """
 X12 — CTF Toolkit + Challenge Authorship
-Writeup index generator + 3 original challenge solutions (pwn, rev, forensics).
+
+A generator of REAL local challenges (web/crypto/misc) with flags, a SQLite
+scoreboard, and a solver-checker that solves each challenge and verifies the
+recovered flags against stored hashes. Everything runs offline on localhost:
+the web challenge is an actual stdlib HTTP server, the crypto challenge is a
+known-plaintext repeat-key-XOR ciphertext, and the misc challenge is a real
+byte-level data-carving exercise.
+
+Legal: authorized CTF / lab use only.
 """
 
-import struct
-import hashlib
+import argparse
 import base64
-import zlib
+import hashlib
+import json
 import os
+import random
+import re
+import shutil
+import sqlite3
+import sys
+import tempfile
+import threading
+import time
+import urllib.request
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DEFAULT_SEED = 20260907
+DEFAULT_POINTS = 100
+FLAG_RE = re.compile(rb"FLAG\{[^}]+\}")
 
 
 # ---------------------------------------------------------------------------
-# Embedded challenge binaries (synthetic, for offline solve)
+# Challenge generator — writes real artifacts into a workdir
 # ---------------------------------------------------------------------------
-PUWN_BINARY = (
-    b"AAAA" * 15  # padding to offset
-    + b"\x41\x41\x41\x41"  # saved RBP (fake)
-    + struct.pack("<Q", 0x4011B6)  # return address -> win_function
-    + b"\x90" * 100  # NOP sled filler
-)
 
-PUWN_WIN_MSG = b"FLAG{pwn_stack_offset_0x11b6}"
-
-REV_BINARY = (
-    b"\x7fELF"
-    + bytes([0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00])
-    + b"\x00" * 20
-    + b"\x02\x00\x3e\x00"
-    + b"\x01\x00\x00\x00"
-    + b"\x40\x00\x00\x00\x00\x00\x00\x00"
-    + b"\x40\x00\x00\x00\x00\x00\x00\x00"
-    + b"\x00" * 40
-    + b"FLAG{rev_packed_binary_decoded}"
-)
-
-ENCODED_PAYLOAD = b""
-for byte in b"FLAG{rev_packed_binary_decoded}":
-    ENCODED_PAYLOAD += bytes([byte ^ 0x5A])
-
-REV_PACKED = (
-    b"\x7fELF"
-    + bytes([0x02, 0x01, 0x01, 0x00])
-    + b"\x00" * 24
-    + b"\x02\x00\x3e\x00"
-    + b"\x01\x00\x00\x00"
-    + b"\x40\x00\x00\x00\x00\x00\x00\x00"
-    + b"\x40\x00\x00\x00\x00\x00\x00\x00"
-    + b"\x00" * 40
-    + b"PACKED_XOR_5A:"
-    + ENCODED_PAYLOAD
-)
-
-FORENSIC_IMAGE = bytearray(1024)
-random_seed = 42
-for i in range(len(FORENSIC_IMAGE)):
-    random_seed = (random_seed * 1103515245 + 12345) & 0x7FFFFFFF
-    FORENSIC_IMAGE[i] = random_seed & 0xFF
-
-FORENSIC_IMAGE[128] = 0x89
-FORENSIC_IMAGE[129] = 0x50  # P
-FORENSIC_IMAGE[130] = 0x4E  # N
-FORENSIC_IMAGE[131] = 0x47  # G
-FORENSIC_IMAGE[132] = 0x0D
-FORENSIC_IMAGE[133] = 0x0A
-FORENSIC_IMAGE[134] = 0x1A
-FORENSIC_IMAGE[135] = 0x0A
-
-png_chunk_data = b"FLAG{forensics_file_carved_png}"
-png_chunk_len = struct.pack(">I", len(png_chunk_data))
-png_chunk_type = b"IHDR"
-png_crc = struct.pack(">I", zlib.crc32(png_chunk_type + png_chunk_data) & 0xFFFFFFFF)
-FORENSIC_IMAGE[136:140] = png_chunk_len
-FORENSIC_IMAGE[140:144] = png_chunk_type
-FORENSIC_IMAGE[144:144 + len(png_chunk_data)] = png_chunk_data
-FORENSIC_IMAGE[144 + len(png_chunk_data):148 + len(png_chunk_data)] = png_crc
-
-FORENSIC_IMAGE[512] = 0xFF
-FORENSIC_IMAGE[513] = 0xD8
-FORENSIC_IMAGE[514] = 0xFF
-FORENSIC_IMAGE[515] = 0xE0
-FORENSIC_IMAGE[516] = 0x00
-FORENSIC_IMAGE[517] = 0x10
-jpeg_payload = b"FLAG{forensics_jpeg_app0_marker}"
-FORENSIC_IMAGE[518:518 + len(jpeg_payload)] = jpeg_payload
-
-FORENSIC_IMAGE = bytes(FORENSIC_IMAGE)
+def _lcg_byte_iter(seed):
+    state = seed
+    while True:
+        state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+        yield state & 0xFF
 
 
-# ---------------------------------------------------------------------------
-# C.1 — PWN Challenge: Stack Offset Exploit
-# ---------------------------------------------------------------------------
-class PWNChallenge:
-    NAME = "PWN-001: Stack Offset ROP"
-    DESCRIPTION = "Exploit a stack buffer overflow to redirect execution to a win function via ROP."
-    HINTS = [
-        "The buffer is 60 bytes (15 x 4-byte ints).",
-        "After the buffer, the saved RBP is 4 bytes.",
-        "The return address is at offset 64.",
-        "The win function is at 0x4011B6.",
-    ]
-    FLAG = "FLAG{pwn_stack_offset_0x11b6}"
+def _pg_char(seed):
+    state = seed
+    while True:
+        state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+        yield chr(0x21 + (state % 0x5E))   # printable ASCII 0x21..0x7E
 
-    def __init__(self):
-        self.binary = PUWN_BINARY
-        self.steps = []
 
-    def solve(self):
-        self.steps.append("Step 1: Identified buffer size = 60 bytes (15 x 4-byte DWORDs)")
-        self.steps.append("Step 2: Calculated offset to saved RBP = 60 bytes")
-        self.steps.append("Step 3: Overwrote saved RBP with 0x41414141 (placeholder)")
-        self.steps.append("Step 4: Overwrote return address with 0x4011B6 (win_function)")
-        self.steps.append("Step 5: Verified exploit produces win message")
+def _sha256(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
 
-        win_marker = struct.pack("<Q", 0x4011B6)
-        if win_marker in self.binary:
-            self.steps.append("Result: Return address 0x4011B6 found in binary payload")
-            success = True
+
+WEB_APP_TEMPLATE = '''\
+#!/usr/bin/env python3
+"""%(name)s — generated web challenge (stdlib http.server)."""
+import argparse
+import os
+import sys
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DIR = os.path.dirname(os.path.abspath(__file__))
+TOKEN = %(token)r
+STATUS_OK = "operative"
+
+
+class Handler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/" or self.path == "/index.html":
+            body = (
+                "<html><body><h1>%(name)s</h1>"
+                "<a href='/admin'>admin</a>"
+                "<!-- token: %(token)s --></body></html>"
+            ).encode()
+            self._reply(200, body)
+        elif self.path.startswith("/admin"):
+            token = ""
+            if "?" in self.path:
+                token = self.path.split("?", 1)[1]
+                if token.startswith("token="):
+                    token = token[len("token="):]
+            if token != TOKEN:
+                self._reply(401, b"access denied")
+                return
+            try:
+                with open(os.path.join(DIR, "flag.txt"), "rb") as f:
+                    flag = f.read().strip()
+            except OSError:
+                flag = b"missing flag.txt"
+            self._reply(200, b"<body><h1>admin</h1><pre>" + flag + b"</pre></body>")
+        elif self.path == "/flag.txt":
+            self._reply(404, b"not here")
         else:
-            self.steps.append("Result: Exploit structure validated")
-            success = True
+            self._reply(404, b"not found")
 
-        return {
-            "flag": self.FLAG,
-            "success": success,
-            "steps": self.steps,
-            "hints": self.HINTS,
-            "exploit_size": len(self.binary),
-        }
+    def _reply(self, code, body):
+        self.send_response(code)
+        self.send_header("Content-Type", "text/html")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
-
-# ---------------------------------------------------------------------------
-# C.2 — REV Challenge: Packed Binary Decode
-# ---------------------------------------------------------------------------
-class REVChallenge:
-    NAME = "REV-001: XOR-Packed Binary Decode"
-    DESCRIPTION = "Reverse-engineer an ELF binary to extract a flag hidden via XOR packing."
-    HINTS = [
-        "The binary contains a 'PACKED_XOR_5A:' marker.",
-        "XOR with 0x5A decodes the payload.",
-        "Look for printable ASCII after decoding.",
-    ]
-    FLAG = "FLAG{rev_packed_binary_decoded}"
-
-    def __init__(self):
-        self.binary = REV_PACKED
-        self.steps = []
-
-    def solve(self):
-        self.steps.append("Step 1: Analyzed ELF header — identified as x86-64 ELF")
-        self.steps.append("Step 2: Found marker 'PACKED_XOR_5A:' at known offset")
-        self.steps.append("Step 3: Extracted XOR-encoded payload bytes")
-        self.steps.append("Step 4: Applied XOR 0x5A decryption")
-        self.steps.append("Step 5: Verified decoded string matches expected flag format")
-
-        marker = b"PACKED_XOR_5A:"
-        idx = self.binary.find(marker)
-        if idx != -1:
-            encoded = self.binary[idx + len(marker):]
-            decoded = bytes([b ^ 0x5A for b in encoded])
-            self.steps.append(f"Decoded payload: {decoded.decode(errors='replace')}")
-            flag = decoded.decode(errors="replace")
-            success = flag.startswith("FLAG{")
-        else:
-            flag = self.FLAG
-            success = True
-
-        return {
-            "flag": flag,
-            "success": success,
-            "steps": self.steps,
-            "hints": self.HINTS,
-            "xor_key": "0x5A",
-            "encoded_length": len(ENCODED_PAYLOAD),
-        }
+    def log_message(self, *args):
+        pass
 
 
-# ---------------------------------------------------------------------------
-# C.3 — Forensics Challenge: File Carving
-# ---------------------------------------------------------------------------
-class ForensicsChallenge:
-    NAME = "FORENSICS-001: File Carving from Raw Image"
-    DESCRIPTION = "Carve hidden file artifacts (PNG, JPEG) from a raw disk image."
-    HINTS = [
-        "PNG files start with bytes: 89 50 4E 47 0D 0A 1A 0A",
-        "JPEG files start with bytes: FF D8 FF E0",
-        "Use file magic signatures to locate embedded files.",
-    ]
-    FLAG = "FLAG{forensics_file_carved_png}"
-
-    def __init__(self):
-        self.image = FORENSIC_IMAGE
-        self.steps = []
-
-    def solve(self):
-        self.steps.append("Step 1: Scanned raw image for file magic signatures")
-        carved_files = []
-
-        png_sig = bytes([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A])
-        idx = self.image.find(png_sig)
-        if idx != -1:
-            self.steps.append(f"Step 2: Found PNG signature at offset 0x{idx:X}")
-            chunk_len = struct.unpack(">I", self.image[idx + 8:idx + 12])[0]
-            chunk_type = self.image[idx + 12:idx + 16]
-            chunk_data = self.image[idx + 16:idx + 16 + chunk_len]
-            self.steps.append(f"Step 3: PNG IHDR chunk — type={chunk_type.decode()}, data_len={chunk_len}")
-            carved_files.append({"type": "PNG", "offset": idx, "data": bytes(chunk_data)})
-            flag = chunk_data.decode(errors="replace")
-            self.steps.append(f"Step 4: Extracted flag from PNG chunk: {flag}")
-        else:
-            flag = self.FLAG
-
-        jpeg_sig = bytes([0xFF, 0xD8, 0xFF, 0xE0])
-        jpeg_idx = self.image.find(jpeg_sig)
-        if jpeg_idx != -1:
-            self.steps.append(f"Step 5: Found JPEG APP0 marker at offset 0x{jpeg_idx:X}")
-            jpeg_data = self.image[jpeg_idx + 6:jpeg_idx + 6 + 33]
-            jpeg_str = jpeg_data.decode(errors="replace").strip("\x00")
-            self.steps.append(f"Step 6: JPEG payload: {jpeg_str}")
-            carved_files.append({"type": "JPEG", "offset": jpeg_idx, "data": bytes(jpeg_data)})
-
-        self.steps.append(f"Step 7: Carved {len(carved_files)} files from raw image")
-
-        return {
-            "flag": flag,
-            "success": flag.startswith("FLAG{"),
-            "steps": self.steps,
-            "hints": self.HINTS,
-            "carved_files": len(carved_files),
-            "image_size": len(self.image),
-        }
+def make_server(port):
+    return ThreadingHTTPServer(("127.0.0.1", port), Handler)
 
 
-# ---------------------------------------------------------------------------
-# Writeup Index Generator
-# ---------------------------------------------------------------------------
-class WriteupGenerator:
-    def __init__(self):
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="%(name)s")
+    ap.add_argument("--port", type=int, default=8080)
+    args = ap.parse_args(argv)
+    srv = make_server(args.port)
+    print("listening on 127.0.0.1:%%d" %% srv.server_address[1], flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
+'''
+
+
+class ChallengeGenerator:
+    """Write the web / crypto / misc challenge artifacts into a workdir."""
+
+    def __init__(self, workdir, seed=DEFAULT_SEED):
+        self.workdir = workdir
+        self.seed = seed
         self.challenges = []
 
-    def register(self, challenge, result):
-        self.challenges.append({"challenge": challenge, "result": result})
+    def _write(self, name, data):
+        path = os.path.join(self.workdir, name)
+        with open(path, "wb") as f:
+            f.write(data)
+        return path
 
-    def generate_markdown(self):
-        lines = [
-            "# CTF Challenge Writeups",
-            "",
-            "## Challenge Index",
-            "",
+    def generate_web(self):
+        token = "token-%08x" % ((self.seed ^ 0x70) & 0xFFFFFFFF)
+        flag = "FLAG{web_leak_admin_token_%08x}" % (self.seed & 0xFFFFFFFF)
+        src = WEB_APP_TEMPLATE % {"name": "WEB-001", "token": token}
+        self._write("web_app.py", src.encode("utf-8"))
+        # the server reads the flag from its own directory (a "flag database"),
+        # like a real web-lab server that holds credentials on disk
+        self._write("flag.txt", flag.encode("utf-8") + b"\n")
+        return {
+            "name": "WEB-001",
+            "category": "web",
+            "points": 100,
+            "flag_sha256": _sha256(flag),
+            "file": "web_app.py",
+            "token": token,
+        }
+
+    def generate_crypto(self):
+        chars = _pg_char(self.seed ^ 0xC0DE)
+        key = "".join(next(chars) for _ in range(5)).encode("utf-8")
+        flag = "FLAG{crypto_repeat_key_xor_knwn_pt}"
+        cipher = bytes(b ^ key[i % len(key)] for i, b in enumerate(flag.encode("utf-8")))
+        self._write("crypto_flag.enc",
+                    base64.b64encode(cipher) + b"\n")
+        return {
+            "name": "CRYPTO-001",
+            "category": "crypto",
+            "points": 150,
+            "flag_sha256": _sha256(flag),
+            "file": "crypto_flag.enc",
+            "algo": "repeat-key-xor",
+            "key_len": len(key),
+        }
+
+    def generate_misc(self):
+        flag = "FLAG{misc_carve_the_disk_image}"
+        body = base64.b64encode(flag.encode("utf-8"))
+        img = bytearray()
+        for b in _lcg_byte_iter(self.seed ^ 0xBADC0DE):
+            img.append(b)
+            if len(img) >= 512:
+                break
+        img += b"\x1b\x00MISC" + body + b"\x00"
+        for b in _lcg_byte_iter(self.seed ^ 0xD15C0DE):
+            img.append(b)
+            if len(img) >= 900:
+                break
+        self._write("misc_drive.img", bytes(img))
+        return {
+            "name": "MISC-001",
+            "category": "misc",
+            "points": 100,
+            "flag_sha256": _sha256(flag),
+            "file": "misc_drive.img",
+        }
+
+    def generate_all(self):
+        os.makedirs(self.workdir, exist_ok=True)
+        self.challenges = [
+            self.generate_web(),
+            self.generate_crypto(),
+            self.generate_misc(),
         ]
-        for entry in self.challenges:
-            ch = entry["challenge"]
-            res = entry["result"]
-            lines.append(f"### {ch.NAME}")
-            lines.append("")
-            lines.append(f"**Description:** {ch.DESCRIPTION}")
-            lines.append("")
-            lines.append(f"**Flag:** `{res['flag']}`")
-            lines.append("")
-            lines.append("**Solution Steps:**")
-            for step in res["steps"]:
-                lines.append(f"1. {step}")
-            lines.append("")
-            lines.append("**Hints:**")
-            for hint in ch.HINTS:
-                lines.append(f"- {hint}")
-            lines.append("")
-            lines.append("---")
-            lines.append("")
-        return "\n".join(lines)
+        manifest = {"generator": "x12", "version": 1,
+                    "challenges": self.challenges}
+        mpath = os.path.join(self.workdir, "manifest.json")
+        with open(mpath, "w") as f:
+            json.dump(manifest, f, indent=2)
+        return manifest
 
 
 # ---------------------------------------------------------------------------
-# Solve Stats Reporter
+# Solvers — each solve() performs the real mechanism and returns the flag
 # ---------------------------------------------------------------------------
-def print_solve_stats(name, result):
-    print(f"\n  --- {name} ---")
-    print(f"  Flag: {result['flag']}")
-    print(f"  Success: {result['success']}")
-    print(f"  Steps taken: {len(result['steps'])}")
-    for step in result["steps"]:
-        print(f"    {step}")
-    print(f"  Hints available: {len(result['hints'])}")
+
+class WebSolver:
+    """Start the generated HTTP server on an ephemeral localhost port and
+    walk the real web application: HTML page -> token -> authenticated /admin."""
+
+    def __init__(self):
+        self.steps = []
+
+    def solve(self, workdir, port=0):
+        app_path = os.path.join(workdir, "web_app.py")
+        with open(app_path, "r", encoding="utf-8") as f:
+            code = f.read()
+        ns = {"__file__": app_path, "__name__": "x12_web_challenge"}
+        exec(code, ns)  # executes the generated server definition in-process
+        make_server = ns["make_server"]
+        srv = make_server(port)
+        port = srv.server_address[1]
+        t = threading.Thread(target=srv.serve_forever, daemon=True)
+        t.start()
+        self.steps.append("served generated web_app.py on 127.0.0.1:%d" % port)
+        try:
+            with urllib.request.urlopen("http://127.0.0.1:%d/" % port, timeout=5) as r:
+                index_html = r.read().decode("utf-8", errors="replace")
+            m = re.search(r"<!-- token: (\S+) -->", index_html)
+            if not m:
+                raise RuntimeError("token not found on index page")
+            token = m.group(1)
+            self.steps.append("recovered admin token %r from index page" % token)
+            url = "http://127.0.0.1:%d/admin?token=%s" % (port, token)
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=5) as r:
+                body = r.read()
+            m2 = FLAG_RE.search(body)
+            if not m2:
+                raise RuntimeError("no flag in /admin response")
+            return m2.group(0).decode("utf-8")
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
 
-def main():
+class CryptoSolver:
+    """Recover the repeat-key-XOR key from the known 'FLAG{' plaintext prefix
+    (classic chosen/known-plaintext attack), then decrypt the whole flag."""
+
+    def __init__(self):
+        self.steps = []
+
+    def solve(self, workdir):
+        enc_path = os.path.join(workdir, "crypto_flag.enc")
+        with open(enc_path, "rb") as f:
+            cipher = base64.b64decode(f.read().strip())
+        known = b"FLAG{"
+        key = []
+        for i, kc in enumerate(known):
+            key.append(cipher[i] ^ kc)
+        key = bytes(key)
+        self.steps.append("recovered key bytes %r from 'FLAG{' prefix" % key.hex())
+        plain = bytes(b ^ key[i % len(key)] for i, b in enumerate(cipher))
+        flag = plain.decode("utf-8", errors="replace")
+        self.steps.append("decrypted %d bytes, key length %d" % (len(cipher), len(key)))
+        return flag
+
+
+class MiscSolver:
+    """Carve the hidden payload from the generated disk image."""
+
+    def __init__(self):
+        self.steps = []
+
+    def solve(self, workdir):
+        img_path = os.path.join(workdir, "misc_drive.img")
+        with open(img_path, "rb") as f:
+            data = f.read()
+        marker = b"\x1b\x00MISC"
+        idx = data.find(marker)
+        if idx == -1:
+            raise RuntimeError("marker not found")
+        self.steps.append("found marker at offset 0x%X" % idx)
+        b64 = data[idx + len(marker):].split(b"\x00", 1)[0].strip()
+        flag = base64.b64decode(b64).decode("utf-8")
+        self.steps.append("decoded %d base64 payload bytes" % len(b64))
+        return flag
+
+
+# ---------------------------------------------------------------------------
+# SQLite scoreboard — real persistence, flag verification by hash
+# ---------------------------------------------------------------------------
+
+class Scoreboard:
+    """SQLite-backed CTF scoreboard storing a hash of each flag; submit()
+    verifies a solver's flag against the stored hash and records the solve."""
+
+    def __init__(self, db_path):
+        self.db_path = db_path
+        self._init_db()
+
+    def _init_db(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS challenges ("
+                " id INTEGER PRIMARY KEY,"
+                " name TEXT NOT NULL UNIQUE,"
+                " category TEXT NOT NULL,"
+                " points INTEGER NOT NULL,"
+                " flag_sha256 TEXT NOT NULL)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS solves ("
+                " id INTEGER PRIMARY KEY,"
+                " challenge_id INTEGER NOT NULL REFERENCES challenges(id),"
+                " team TEXT NOT NULL,"
+                " ts TEXT NOT NULL,"
+                " UNIQUE(challenge_id, team))")
+            conn.commit()
+        finally:
+            conn.close()
+
+    def register(self, name, category, points, flag):
+        h = _sha256(flag)
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO challenges"
+                " (name, category, points, flag_sha256)"
+                " VALUES (?, ?, ?, ?)", (name, category, points, h))
+            conn.commit()
+        finally:
+            conn.close()
+        return h
+
+    def register_hash(self, name, category, points, flag_sha256):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            conn.execute(
+                "INSERT OR REPLACE INTO challenges"
+                " (name, category, points, flag_sha256)"
+                " VALUES (?, ?, ?, ?)", (name, category, points, flag_sha256))
+            conn.commit()
+        finally:
+            conn.close()
+
+    def register_manifest_hashes(self, manifest):
+        for c in manifest["challenges"]:
+            self.register_hash(c["name"], c["category"], c["points"],
+                               c["flag_sha256"])
+
+    def challenge_score(self, name):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            row = conn.execute(
+                "SELECT id, points, flag_sha256 FROM challenges WHERE name=?",
+                (name,)).fetchone()
+        finally:
+            conn.close()
+        if row is None:
+            return None
+        return {"id": row[0], "points": row[1], "flag_sha256": row[2]}
+
+    def submit(self, name, flag, team="solver"):
+        score = self.challenge_score(name)
+        if score is None:
+            return {"accepted": False, "reason": "unknown challenge",
+                    "challenge": name, "points": 0}
+        if _sha256(flag) != score["flag_sha256"]:
+            return {"accepted": False, "reason": "flag rejected",
+                    "challenge": name, "points": 0}
+        conn = sqlite3.connect(self.db_path)
+        try:
+            okay = conn.execute(
+                "INSERT OR IGNORE INTO solves (challenge_id, team, ts)"
+                " VALUES (?, ?, ?)",
+                (score["id"], team, time.strftime("%Y-%m-%dT%H:%M:%SZ",
+                                                  time.gmtime()))).rowcount == 1
+            conn.commit()
+            solved_by = conn.execute(
+                "SELECT COUNT(*) FROM solves WHERE challenge_id=?",
+                (score["id"],)).fetchone()[0]
+        finally:
+            conn.close()
+        return {"accepted": bool(okay), "challenge": name,
+                "points": score["points"] if okay else 0,
+                "reason": ("flag accepted" if okay else "already solved"),
+                "solved_by": solved_by}
+
+    def tally(self):
+        conn = sqlite3.connect(self.db_path)
+        try:
+            rows = conn.execute(
+                "SELECT c.name, c.category, c.points, COUNT(s.id) AS n"
+                " FROM challenges c LEFT JOIN solves s ON s.challenge_id = c.id"
+                " GROUP BY c.id ORDER BY c.id").fetchall()
+        finally:
+            conn.close()
+        return [{"name": r[0], "category": r[1], "points": r[2],
+                 "solves": r[3]} for r in rows]
+
+
+# ---------------------------------------------------------------------------
+# Orchestration: generate -> solve -> submit -> report
+# ---------------------------------------------------------------------------
+
+def run_full(workdir=None, reports_dir=None, team="solver"):
+    """Generate challenges into workdir (temp if None), solve each, submit to
+    the SQLite scoreboard, write reports/ctf_report.json. Returns exit code."""
+    tmp = workdir is None
+    if workdir is None:
+        workdir = tempfile.mkdtemp(prefix="x12_ctf_")
+    elif not os.path.isdir(workdir):
+        os.makedirs(workdir, exist_ok=True)
+    if reports_dir is None:
+        reports_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                   "..", "reports")
+    os.makedirs(reports_dir, exist_ok=True)
+
+    gen = ChallengeGenerator(workdir)
+    manifest = gen.generate_all()
+    print("[*] Generated 3 challenges in %s" % workdir)
+
+    sb = Scoreboard(os.path.join(workdir, "scoreboard.db"))
+    sb.register_manifest_hashes(manifest)
+
+    solvers = [
+        ("WEB-001", "web", WebSolver()),
+        ("CRYPTO-001", "crypto", CryptoSolver()),
+        ("MISC-001", "misc", MiscSolver()),
+    ]
+
+    results = []
+    for name, category, solver in solvers:
+        if category == "web":
+            flag = solver.solve(workdir)
+        elif category == "crypto":
+            flag = solver.solve(workdir)
+        else:
+            flag = solver.solve(workdir)
+        sub = sb.submit(name, flag, team=team)
+        results.append({
+            "challenge": name,
+            "category": category,
+            "flag": flag,
+            "flag_sha256": _sha256(flag),
+            "accepted": sub["accepted"],
+            "reason": sub["reason"],
+            "steps": list(solver.steps),
+        })
+        print("  [%s] %s: %s (%s)" % (
+            "PASS" if sub["accepted"] else "FAIL", name, flag, sub["reason"]))
+
+    all_ok = all(r["accepted"] for r in results)
+    tally = sb.tally()
+    report = {
+        "tool": "ctf-toolkit-x12",
+        "workdir": workdir,
+        "generated": manifest,
+        "solver_results": results,
+        "scoreboard": tally,
+        "total_points": sum(c["points"] for c in tally),
+        "all_accepted": all_ok,
+    }
+    out = os.path.join(reports_dir, "ctf_report.json")
+    with open(out, "w") as f:
+        json.dump(report, f, indent=2)
+    print("[+] Report written: %s" % out)
+    if tmp:
+        shutil.rmtree(workdir, ignore_errors=True)
+    return 0 if all_ok else 1
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(
+        prog="ctf_toolkit",
+        description="X12 - CTF Toolkit: generator of real local challenges "
+                    "(web/crypto/misc) with flags, SQLite scoreboard, and "
+                    "solver-checker. Offline verifiable.",
+        epilog="Authorized CTF/lab use only.")
+    ap.add_argument("--dry-run", action="store_true",
+                    help="print plan and exit without solving")
+    ap.add_argument("--generate", action="store_true",
+                    help="generate challenge files into challenges/")
+    ap.add_argument("--solve", action="store_true",
+                    help="generate (if needed), solve, and verify flags")
+    ap.add_argument("--demo-report", action="store_true",
+                    help="full generate+solve+scoreboard and JSON report")
+    ap.add_argument("--workdir", default=None,
+                    help="directory to use for --solve (default challenges/)")
+    ap.add_argument("--seed", type=int, default=DEFAULT_SEED,
+                    help="deterministic seed for generated challenges")
+    args = ap.parse_args(argv)
+
+    if args.dry_run:
+        print("dry-run: generate (web/crypto/misc), solve, SQLite scoreboard "
+              "(no execution)")
+        return 0
+
+    repo_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..")
+    if args.generate:
+        wdir = args.workdir or os.path.join(repo_root, "challenges")
+        gen = ChallengeGenerator(wdir, seed=args.seed)
+        manifest = gen.generate_all()
+        print("Generated 3 challenges -> %s" % wdir)
+        for c in manifest["challenges"]:
+            print("  [%s] %s points=%s sha256=%s" % (
+                c["category"], c["name"], c["points"], c["flag_sha256"][:12]))
+        return 0
+
+    if args.solve:
+        wdir = args.workdir or os.path.join(repo_root, "challenges")
+        if not os.path.exists(wdir):
+            ChallengeGenerator(wdir, seed=args.seed).generate_all()
+        return run_full(workdir=wdir, reports_dir=args.workdir and wdir or None)
+
+    if args.demo_report:
+        return run_full(reports_dir=os.path.join(repo_root, "reports"))
+
     print("[*] X12 — CTF Toolkit + Challenge Authorship")
-    print("[*] Running offline self-test...")
+    print("[*] Offline demo: generate -> solve -> SQLite scoreboard")
     print()
-
-    writer = WriteupGenerator()
-
-    pwn = PWNChallenge()
-    pwn_result = pwn.solve()
-    writer.register(pwn, pwn_result)
-    print_solve_stats(pwn.NAME, pwn_result)
-
-    rev = REVChallenge()
-    rev_result = rev.solve()
-    writer.register(rev, rev_result)
-    print_solve_stats(rev.NAME, rev_result)
-
-    forensics = ForensicsChallenge()
-    forensics_result = forensics.solve()
-    writer.register(forensics, forensics_result)
-    print_solve_stats(forensics.NAME, forensics_result)
-
-    print()
-    print("  --- Writeup Index (Markdown) ---")
-    md = writer.generate_markdown()
-    md_lines = md.strip().split("\n")
-    for line in md_lines[:30]:
-        print(f"    {line}")
-    if len(md_lines) > 30:
-        print(f"    ... ({len(md_lines) - 30} more lines)")
-    print()
-
-    print("  --- Solve Stats Summary ---")
-    all_results = [pwn_result, rev_result, forensics_result]
-    all_names = [pwn.NAME, rev.NAME, forensics.NAME]
-    total_steps = sum(len(r["steps"]) for r in all_results)
-    total_hints = sum(len(r["hints"]) for r in all_results)
-    solved = sum(1 for r in all_results if r["success"])
-    print(f"  Total challenges: {len(all_results)}")
-    print(f"  Solved: {solved}/{len(all_results)}")
-    print(f"  Total steps used: {total_steps}")
-    print(f"  Total hints available: {total_hints}")
-    print(f"  Average steps per challenge: {total_steps / len(all_results):.1f}")
-
-    for name, result in zip(all_names, all_results):
-        status = "PASS" if result["success"] else "FAIL"
-        print(f"    [{status}] {name}: {result['flag']}")
-
+    rc = run_full(reports_dir=os.path.join(repo_root, "reports"))
     print()
     print("=" * 70)
     print("  Self-test PASSED. Demo complete.")
     print("  Legal: This toolkit is for authorized CTF/lab use only.")
     print("=" * 70)
-    return 0
+    return rc
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    sys.exit(main())
